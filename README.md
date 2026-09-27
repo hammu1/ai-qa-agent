@@ -4,7 +4,7 @@
   <img alt="Python" src="https://img.shields.io/badge/Python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white">
   <img alt="Playwright" src="https://img.shields.io/badge/Playwright-web%20%2B%20extension-2EAD33?style=flat-square">
   <img alt="Appium" src="https://img.shields.io/badge/Appium-Android%20%2B%20iOS-662D91?style=flat-square">
-  <img alt="License" src="https://img.shields.io/badge/License-MIT-blue?style=flat-square">
+  <img alt="License" src="https://img.shields.io/badge/License-All%20Rights%20Reserved-lightgrey?style=flat-square">
 </p>
 
 One entrypoint that asks **what** you want to test, checks whether this machine can actually test it, scaffolds the project, executes a declarative test plan, and produces an Excel/Markdown test-case doc plus a PDF report with screenshots and reproduction steps.
@@ -242,6 +242,9 @@ runners/
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+**All Rights Reserved** — see [LICENSE](LICENSE).
+
+This code is published for portfolio and evaluation purposes. You're welcome to read it;
+reuse in your own projects requires written permission.
 
 Built by [Syed Hammad Ali](https://github.com/hammu1) · AI QA Engineer
