@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.env
+.env.qa
+*.env.qa
+qa-projects/
+test_results/
+screenshots/
+logs/
+*.pdf
+*.xlsx
+.venv/
+venv/

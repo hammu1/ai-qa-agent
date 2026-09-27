@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# ===========================================================================
+#  QA Automation Agent - dynamic multi-platform router
+#
+#  Run with no arguments for an interactive session that asks what to test,
+#  checks whether this machine can test it, and scaffolds the project:
+#
+#      ./qa
+#
+#  Or drive it non-interactively:
+#
+#      ./qa doctor                       capability report for every platform
+#      ./qa doctor android               one platform
+#      ./qa init                         interactive project setup
+#      ./qa run    <project>             execute the test plan
+#      ./qa cases  <project>             export test cases to .xlsx + .md
+#      ./qa report <project>             build the HTML + PDF report
+#      ./qa full   <project>             run + cases + report in one shot
+#      ./qa list                         all known projects and their status
+#      ./qa open   <project>             print the project's artifact paths
+#
+#  Common run flags (passed through):
+#      --only TC-001,TC-002   --tag smoke   --suite F-01
+#      --headed               --parallel N
+# ===========================================================================
+set -uo pipefail
+
+AGENT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export AGENT_ROOT
+export QA_WORKSPACE="${QA_WORKSPACE:-$HOME/qa-projects}"
+PY="${PYTHON:-python3}"
+
+BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+GREEN=$'\033[32m'; RED=$'\033[31m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'
+
+say()  { printf '%s\n' "$*"; }
+head1() { printf '\n%s%s%s\n' "$BOLD" "$*" "$RESET"; }
+ok()   { printf '%s%s%s\n' "$GREEN" "$*" "$RESET"; }
+warn() { printf '%s%s%s\n' "$YELLOW" "$*" "$RESET"; }
+err()  { printf '%s%s%s\n' "$RED" "$*" "$RESET" >&2; }
+
+# Prompts read from the terminal when there is one, otherwise from stdin - so the
+# same flow can be driven interactively or fed answers from a pipe/heredoc.
+if [[ -r /dev/tty && -t 1 ]]; then QA_IN=/dev/tty; else QA_IN=/dev/stdin; fi
+
+ask() {  # ask <prompt> <default> -> echoes answer
+  local prompt="$1" default="${2:-}" reply
+  if [[ -n "$default" ]]; then
+    read -r -p "$prompt [$default]: " reply <"$QA_IN" || true
+    printf '%s' "${reply:-$default}"
+  else
+    read -r -p "$prompt: " reply <"$QA_IN" || true
+    printf '%s' "$reply"
+  fi
+}
+
+ask_yn() {  # ask_yn <prompt> <default y|n>
+  local prompt="$1" default="${2:-y}" reply
+  read -r -p "$prompt [$([[ $default == y ]] && echo 'Y/n' || echo 'y/N')]: " reply <"$QA_IN" || true
+  reply="${reply:-$default}"
+  [[ "${reply,,}" == y* ]]
+}
+
+# --- resolve a project name/path to its directory ---------------------------
+project_dir() {
+  local name="$1"
+  if [[ -d "$name" && -f "$name/.qa-config.json" ]]; then
+    (cd "$name" && pwd); return 0
+  fi
+  local slug
+  slug="$("$PY" -c "import sys;sys.path.insert(0,'$AGENT_ROOT');from core.common import slugify;print(slugify(sys.argv[1]))" "$name")"
+  if [[ -d "$QA_WORKSPACE/$slug" ]]; then
+    printf '%s' "$QA_WORKSPACE/$slug"; return 0
+  fi
+  return 1
+}
+
+need_project() {
+  local given="${1:-}"
+  if [[ -z "$given" ]]; then
+    err "This command needs a project name. Try: ./qa list"
+    exit 2
+  fi
+  local dir
+  if ! dir="$(project_dir "$given")"; then
+    err "No project '$given' under $QA_WORKSPACE"
+    say "Known projects:"; cmd_list
+    exit 2
+  fi
+  printf '%s' "$dir"
+}
+
+# --- capability status for one platform (READY / PARTIAL / BLOCKED) --------
+platform_status() {
+  "$PY" - "$1" <<'PYEOF' 2>/dev/null || echo "BLOCKED|checker failed"
+import sys, os
+sys.path.insert(0, os.environ["AGENT_ROOT"])
+from core import doctor
+r = doctor.check(sys.argv[1])
+print(f"{r['status']}|{r.get('detail','')}")
+PYEOF
+}
+
+status_line() {
+  local plat="$1" label="$2" raw st detail icon
+  raw="$(platform_status "$plat")"
+  st="${raw%%|*}"; detail="${raw#*|}"
+  case "$st" in
+    READY)   icon="${GREEN}READY  ${RESET}" ;;
+    PARTIAL) icon="${YELLOW}PARTIAL${RESET}" ;;
+    *)       icon="${RED}BLOCKED${RESET}" ;;
+  esac
+  printf '  %s  %-22s %s%s%s\n' "$icon" "$label" "$DIM" "$detail" "$RESET"
+}
+
+# ===========================================================================
+#  init - the dynamic "what do you want to test?" flow
+# ===========================================================================
+cmd_init() {
+  head1 "QA Automation Agent - what are we testing?"
+  say "${DIM}Capability of this machine, checked live:${RESET}"
+  export AGENT_ROOT
+  status_line web       "1) Web application"
+  status_line extension "2) Browser extension"
+  status_line android   "3) Android app"
+  status_line ios       "4) iOS app"
+  say ""
+
+  local choice platform
+  while :; do
+    choice="$(ask "Select platform (1-4)" "1")"
+    case "$choice" in
+      1|web)       platform=web;       break ;;
+      2|ext|extension) platform=extension; break ;;
+      3|android)   platform=android;   break ;;
+      4|ios)       platform=ios;       break ;;
+      *) warn "Pick 1, 2, 3 or 4." ;;
+    esac
+  done
+
+  # Warn (do not block) if the chosen platform cannot run here.
+  local raw st
+  raw="$(platform_status "$platform")"; st="${raw%%|*}"
+  if [[ "$st" != "READY" ]]; then
+    say ""
+    warn "Heads up: '$platform' is $st on this machine."
+    "$PY" "$AGENT_ROOT/core/doctor.py" "$platform" | sed 's/^/    /'
+    if ! ask_yn "Scaffold the project anyway (test cases can still be authored)?" y; then
+      say "Aborted."; return 1
+    fi
+  fi
+
+  local project target parallel=4
+  project="$(ask "Project name")"
+  [[ -z "$project" ]] && { err "A project name is required."; return 2; }
+
+  case "$platform" in
+    web)
+      local url browser headless viewport hl="true"
+      url="$(ask "Base URL (e.g. https://staging.example.com)")"
+      [[ -z "$url" ]] && { err "A base URL is required for web testing."; return 2; }
+      browser="$(ask "Browser (chromium/firefox/chrome)" "chromium")"
+      ask_yn "Run headless?" y || hl="false"
+      viewport="$(ask "Viewport WxH" "1440x900")"
+      parallel="$(ask "Parallel workers" "4")"
+      target=$(cat <<JSON
+{"base_url": "${url%/}", "browser": "$browser", "headless": $hl,
+ "viewport": {"width": ${viewport%x*}, "height": ${viewport#*x}},
+ "timeout": 15000, "ignore_https_errors": true}
+JSON
+)
+      ;;
+    extension)
+      local extpath url
+      extpath="$(ask "Path to the UNPACKED extension directory (with manifest.json)")"
+      if [[ ! -f "$extpath/manifest.json" ]]; then
+        warn "No manifest.json found at $extpath - the run will be BLOCKED until that path is valid."
+      fi
+      url="$(ask "A site URL for content-script tests (optional)" "https://example.com")"
+      target=$(cat <<JSON
+{"extension_path": "$extpath", "base_url": "${url%/}", "headless": false,
+ "viewport": {"width": 1440, "height": 900}, "timeout": 15000}
+JSON
+)
+      parallel=1
+      ;;
+    android)
+      local apk pkg activity device devlist
+      devlist="$(adb devices 2>/dev/null | awk 'NR>1 && $2=="device" {print $1}' | paste -sd, -)"
+      if [[ -n "$devlist" ]]; then
+        ok "  devices online: $devlist"
+      else
+        warn "  no device online - runs will be BLOCKED until you attach one (adb devices)"
+      fi
+      apk="$(ask "Path to .apk (blank if the app is already installed)")"
+      pkg="$(ask "appPackage (e.g. com.example.app)")"
+      activity="$(ask "appActivity (blank to let Appium resolve it)")"
+      device="$(ask "Device serial (blank = auto-select)" "${devlist%%,*}")"
+      target=$(cat <<JSON
+{"app": "$apk", "appPackage": "$pkg", "appActivity": "$activity",
+ "device": "$device", "server": "http://127.0.0.1:4723",
+ "automationName": "UiAutomator2", "autoGrantPermissions": true, "timeout": 15000}
+JSON
+)
+      parallel=1
+      ;;
+    ios)
+      local app bundle udid server
+      warn "iOS requires macOS + Xcode. On this Linux host, execution will be BLOCKED;"
+      warn "point 'server' at a macOS runner or cloud device farm to execute remotely."
+      app="$(ask "Path to .app/.ipa (or blank)")"
+      bundle="$(ask "bundleId (e.g. com.example.app)")"
+      udid="$(ask "Device UDID / simulator name" "iPhone 15")"
+      server="$(ask "Appium server URL" "http://127.0.0.1:4723")"
+      target=$(cat <<JSON
+{"app": "$app", "bundleId": "$bundle", "udid": "$udid", "deviceName": "$udid",
+ "server": "$server", "automationName": "XCUITest", "timeout": 20000}
+JSON
+)
+      parallel=1
+      ;;
+  esac
+
+  say ""
+  local out dir
+  out="$("$PY" "$AGENT_ROOT/core/scaffold.py" --project "$project" --platform "$platform" \
+         --target "$target" --parallel "$parallel")" || return $?
+  say "$out"
+  dir="$(project_dir "$project")" || return 1
+
+  ok "Project ready: $dir"
+  head1 "Next steps"
+  say "  1. Add credentials (if any):    \$EDITOR $dir/.env.qa"
+  say "  2. Author the test plan:        \$EDITOR $dir/test_cases/testplan.json"
+  say "     ${DIM}(or ask the QA agent: \"generate test cases for <feature>\")${RESET}"
+  say "  3. Export the test case doc:    ./qa cases \"$project\""
+  say "  4. Execute + report:            ./qa full \"$project\""
+  say "  5. Portable re-run for anyone:  $dir/run_tests.sh"
+}
+
+# ===========================================================================
+cmd_run() {
+  local dir; dir="$(need_project "${1:-}")" || exit $?; shift || true
+  head1 "Running: $dir"
+  # Load secrets so ${VAR} references in the plan resolve.
+  [[ -f "$dir/.env.qa" ]] && { set -a; source "$dir/.env.qa"; set +a; }
+  "$PY" "$AGENT_ROOT/qa_run.py" --project-dir "$dir" "$@"
+}
+
+cmd_cases() {
+  local dir; dir="$(need_project "${1:-}")" || exit $?; shift || true
+  "$PY" "$AGENT_ROOT/core/testcases.py" --project-dir "$dir" "$@"
+}
+
+cmd_report() {
+  local dir; dir="$(need_project "${1:-}")" || exit $?; shift || true
+  "$PY" "$AGENT_ROOT/core/report.py" --project-dir "$dir" "$@"
+}
+
+cmd_full() {
+  local name="${1:-}"; local dir; dir="$(need_project "$name")" || exit $?; shift || true
+  head1 "Full cycle: $dir"
+  [[ -f "$dir/.env.qa" ]] && { set -a; source "$dir/.env.qa"; set +a; }
+  "$PY" "$AGENT_ROOT/qa_run.py" --project-dir "$dir" "$@"
+  local rc=$?
+  # Export and report regardless of test outcome - a red run still needs docs.
+  "$PY" "$AGENT_ROOT/core/testcases.py" --project-dir "$dir"
+  "$PY" "$AGENT_ROOT/core/report.py"   --project-dir "$dir"
+  head1 "Artifacts"
+  cmd_open "$name"
+  return $rc
+}
+
+cmd_list() {
+  if [[ ! -d "$QA_WORKSPACE" ]]; then
+    say "${DIM}No projects yet ($QA_WORKSPACE does not exist). Run: ./qa init${RESET}"
+    return 0
+  fi
+  local found=0
+  printf '  %-26s %-11s %-9s %s\n' "PROJECT" "PLATFORM" "CASES" "LAST RESULT"
+  for d in "$QA_WORKSPACE"/*/; do
+    [[ -f "$d/.qa-config.json" ]] || continue
+    found=1
+    "$PY" - "$d" <<'PYEOF'
+import json, sys
+from pathlib import Path
+d = Path(sys.argv[1])
+cfg = json.loads((d / ".qa-config.json").read_text())
+plan = d / "test_cases" / "testplan.json"
+n = 0
+if plan.exists():
+    try:
+        n = sum(len(s.get("cases", [])) for s in json.loads(plan.read_text()).get("suites", []))
+    except Exception:
+        n = 0
+res = d / "test_results" / "results.json"
+last = "never run"
+if res.exists():
+    try:
+        r = json.loads(res.read_text())
+        cases = r.get("cases", [])
+        p = sum(1 for c in cases if c.get("status") == "PASS")
+        f = sum(1 for c in cases if c.get("status") == "FAIL")
+        b = sum(1 for c in cases if c.get("status") == "BLOCKED")
+        last = f"{p}P/{f}F/{b}B  {(r.get('finished') or '')[:19]}"
+    except Exception:
+        last = "unreadable results.json"
+print(f"  {cfg.get('project','?')[:25]:<26} {cfg.get('platform','?'):<11} {n:<9} {last}")
+PYEOF
+  done
+  [[ "$found" == 0 ]] && say "${DIM}  (none yet - run ./qa init)${RESET}"
+  return 0
+}
+
+cmd_open() {
+  local dir; dir="$(need_project "${1:-}")" || exit $?
+  say "  config      $dir/.qa-config.json"
+  say "  test plan   $dir/test_cases/testplan.json"
+  for f in "$dir"/test_cases/*.xlsx "$dir"/test_cases/*.md; do
+    [[ -e "$f" ]] && say "  cases doc   $f"
+  done
+  local pdf
+  pdf="$(ls -t "$dir"/test_results/*.pdf 2>/dev/null | head -1)"
+  [[ -n "$pdf" ]] && say "  ${BOLD}PDF report  $pdf${RESET}"
+  local htm
+  htm="$(ls -t "$dir"/test_results/*.html 2>/dev/null | head -1)"
+  [[ -n "$htm" ]] && say "  HTML report $htm"
+  say "  results     $dir/test_results/results.json"
+  say "  screenshots $dir/screenshots/  ($(ls -1 "$dir"/screenshots 2>/dev/null | wc -l) file(s))"
+  local lg
+  lg="$(ls -t "$dir"/logs/* 2>/dev/null | head -1)"
+  [[ -n "$lg" ]] && say "  latest log  $lg"
+  say "  re-run      $dir/run_tests.sh"
+}
+
+cmd_help() { sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+# ===========================================================================
+case "${1:-init}" in
+  init|"")            shift || true; cmd_init "$@" ;;
+  doctor|check)       shift || true; "$PY" "$AGENT_ROOT/core/doctor.py" "$@" ;;
+  run|test)           shift || true; cmd_run "$@" ;;
+  cases|plan-export)  shift || true; cmd_cases "$@" ;;
+  report)             shift || true; cmd_report "$@" ;;
+  full|all)           shift || true; cmd_full "$@" ;;
+  list|ls)            shift || true; cmd_list "$@" ;;
+  open|paths)         shift || true; cmd_open "$@" ;;
+  help|-h|--help)     cmd_help ;;
+  *) err "Unknown command: $1"; cmd_help; exit 2 ;;
+esac
